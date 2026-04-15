@@ -1,0 +1,457 @@
+"""
+E0 251O (2026) Project: Property-Based Testing for NetworkX
+==========================================================
+Team member: Shreya Gupta (solo)
+
+Algorithm under test: Dijkstra's algorithm
+    - networkx.shortest_path
+    - networkx.shortest_path_length
+    - networkx.dijkstra_path / dijkstra_path_length
+    - networkx.all_pairs_dijkstra_path_length
+
+This file contains 5 property-based tests written using Hypothesis.
+Each test checks an important property that should always hold for
+shortest-path algorithms on graphs with non-negative edge weights.
+"""
+
+import math
+
+import networkx as nx
+from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import strategies as st
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis strategies for generating graphs
+# ---------------------------------------------------------------------------
+
+# Keep graphs small enough for Hypothesis to explore many cases,
+# but large enough that non-trivial shortest paths still appear.
+MAX_NODES = 12
+MIN_WEIGHT = 1
+MAX_WEIGHT = 50
+
+
+@st.composite
+def weighted_graphs(draw, directed=False, min_nodes=2, max_nodes=MAX_NODES):
+    """Generate a random weighted graph.
+
+    The graph can be directed or undirected. For each possible edge,
+    we randomly decide whether to include it, and if included, we assign
+    it a positive integer weight.
+
+    This gives us graphs of different sizes and densities, which helps
+    test shortest-path behavior across many shapes.
+    """
+    n = draw(st.integers(min_value=min_nodes, max_value=max_nodes))
+    G = nx.DiGraph() if directed else nx.Graph()
+    G.add_nodes_from(range(n))
+
+    pairs = [
+        (u, v)
+        for u in range(n)
+        for v in range(n)
+        if (u != v and (directed or u < v))
+    ]
+
+    include = draw(
+        st.lists(
+            st.booleans(),
+            min_size=len(pairs),
+            max_size=len(pairs),
+        )
+    )
+    weights = draw(
+        st.lists(
+            st.integers(min_value=MIN_WEIGHT, max_value=MAX_WEIGHT),
+            min_size=len(pairs),
+            max_size=len(pairs),
+        )
+    )
+
+    for (u, v), keep, w in zip(pairs, include, weights):
+        if keep:
+            G.add_edge(u, v, weight=w)
+    return G
+
+
+@st.composite
+def connected_weighted_graphs(draw, min_nodes=2, max_nodes=MAX_NODES):
+    """Generate a connected undirected weighted graph.
+
+    We first create a random spanning tree so that all nodes are connected.
+    After that, we randomly add extra edges with positive weights.
+
+    This avoids wasting time generating disconnected graphs for tests
+    where we want every node pair to have a valid path between them.
+    """
+    n = draw(st.integers(min_value=min_nodes, max_value=max_nodes))
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+
+    # Build a random spanning tree by connecting each new node
+    # to one earlier node.
+    for i in range(1, n):
+        parent = draw(st.integers(min_value=0, max_value=i - 1))
+        w = draw(st.integers(min_value=MIN_WEIGHT, max_value=MAX_WEIGHT))
+        G.add_edge(parent, i, weight=w)
+
+    # Add optional extra edges.
+    extra_pairs = [
+        (u, v)
+        for u in range(n)
+        for v in range(u + 1, n)
+        if not G.has_edge(u, v)
+    ]
+    if extra_pairs:
+        include = draw(
+            st.lists(
+                st.booleans(),
+                min_size=len(extra_pairs),
+                max_size=len(extra_pairs),
+            )
+        )
+        weights = draw(
+            st.lists(
+                st.integers(min_value=MIN_WEIGHT, max_value=MAX_WEIGHT),
+                min_size=len(extra_pairs),
+                max_size=len(extra_pairs),
+            )
+        )
+        for (u, v), keep, w in zip(extra_pairs, include, weights):
+            if keep:
+                G.add_edge(u, v, weight=w)
+    return G
+
+
+def _path_weight(G, path):
+    """Return the total weight of a path."""
+    return sum(G[path[i]][path[i + 1]]["weight"] for i in range(len(path) - 1))
+
+
+# ---------------------------------------------------------------------------
+# Test 1 — Returned path should be valid and match reported distance
+# ---------------------------------------------------------------------------
+@settings(suppress_health_check=[HealthCheck.filter_too_much], max_examples=200)
+@given(connected_weighted_graphs())
+def test_returned_path_is_valid_and_length_matches(G):
+    """
+    Property being tested
+    ---------------------
+    This test checks that the path returned by Dijkstra's algorithm is
+    valid and agrees with the distance reported by the algorithm. For
+    every pair of distinct nodes (s, t), the returned path must:
+    1. start at s and end at t,
+    2. move only through edges that actually exist in the graph, and
+    3. have total weight equal to the shortest-path length reported for
+       that same node pair.
+
+    Why this property is important
+    ------------------------------
+    A shortest-path algorithm should not only give a numeric distance,
+    but also provide a path that really achieves that distance. The path
+    is the concrete evidence behind the answer. If the path is invalid,
+    or if its weight does not match the reported length, then the output
+    of the algorithm is internally inconsistent.
+
+    Mathematical / algorithmic reasoning
+    ------------------------------------
+    Dijkstra's algorithm computes shortest distances and can also
+    reconstruct the corresponding path using predecessor information.
+    These two outputs should always agree. If a path is claimed to be
+    shortest, then summing the edge weights along that path should give
+    exactly the same value as the reported shortest distance.
+
+    Graphs generated for this test
+    ------------------------------
+    The test generates connected, undirected graphs with positive
+    integer edge weights. Connectivity is guaranteed by first building a
+    spanning tree and then optionally adding more random edges. Because
+    the graph is connected, every pair of nodes is reachable.
+
+    Assumptions / preconditions
+    ---------------------------
+    - The graph is connected.
+    - The graph is undirected.
+    - All edge weights are strictly positive.
+    - A shortest path exists between every pair of distinct nodes.
+
+    What a failure would suggest
+    ----------------------------
+    A failure here would suggest a bug either in distance computation or
+    in path reconstruction. For example, the algorithm may be reporting
+    the right distance but building the wrong predecessor chain, or it
+    may be returning a path whose total cost does not actually match the
+    claimed shortest-path value.
+    """
+    nodes = list(G.nodes)
+    for s in nodes:
+        lengths = nx.single_source_dijkstra_path_length(G, s)
+        for t in nodes:
+            if s == t:
+                continue
+            path = nx.dijkstra_path(G, s, t)
+            assert path[0] == s and path[-1] == t
+            for a, b in zip(path, path[1:]):
+                assert G.has_edge(a, b), f"{a}-{b} not an edge"
+            assert _path_weight(G, path) == lengths[t]
+
+
+# ---------------------------------------------------------------------------
+# Test 2 — Triangle inequality
+# ---------------------------------------------------------------------------
+@settings(suppress_health_check=[HealthCheck.filter_too_much], max_examples=200)
+@given(connected_weighted_graphs(min_nodes=3))
+def test_triangle_inequality(G):
+    """
+    Property being tested
+    ---------------------
+    This test checks that shortest-path distances satisfy the triangle
+    inequality. For any three nodes (u, v, w), the distance from u to w
+    should be no more than the distance from u to v plus the distance
+    from v to w.
+
+    Why this property is important
+    ------------------------------
+    Shortest-path distance on graphs with non-negative weights should
+    behave like a metric, or at least a pseudo-metric. The triangle
+    inequality is one of the most basic properties such distances must
+    satisfy. If it fails, then at least one of the computed shortest
+    distances must be incorrect.
+
+    Mathematical / algorithmic reasoning
+    ------------------------------------
+    If we combine a shortest path from u to v with a shortest path from
+    v to w, we get some valid walk from u to w with total length
+    d(u, v) + d(v, w). Since d(u, w) is defined as the minimum possible
+    path length from u to w, it cannot be larger than the length of that
+    combined walk.
+
+    Graphs generated for this test
+    ------------------------------
+    The test uses connected, undirected weighted graphs with at least
+    three nodes and positive integer edge weights. Since the graphs are
+    connected, distances exist between every pair of nodes, so the
+    inequality can be checked for all triples.
+
+    Assumptions / preconditions
+    ---------------------------
+    - The graph is connected.
+    - The graph is undirected.
+    - All edge weights are positive.
+    - Dijkstra's algorithm is valid because no negative weights appear.
+
+    What a failure would suggest
+    ----------------------------
+    A failure would suggest that the algorithm produced an incorrect
+    shortest-path distance for at least one node pair. That could happen
+    if an edge was not relaxed correctly, if a tentative distance was
+    updated wrongly, or if the algorithm missed a cheaper path.
+    """
+    dist = dict(nx.all_pairs_dijkstra_path_length(G))
+    nodes = list(G.nodes)
+    for u in nodes:
+        for v in nodes:
+            for w in nodes:
+                assert dist[u][w] <= dist[u][v] + dist[v][w] + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — Subpath optimality
+# ---------------------------------------------------------------------------
+@settings(suppress_health_check=[HealthCheck.filter_too_much], max_examples=200)
+@given(connected_weighted_graphs(min_nodes=3))
+def test_subpath_optimality(G):
+    """
+    Property being tested
+    ---------------------
+    This test checks subpath optimality: if a path from s to t is a
+    shortest path, then every contiguous section of that path must also
+    be a shortest path between its own endpoints.
+
+    Why this property is important
+    ------------------------------
+    This is a core structural property of shortest paths. A shortest
+    path should not contain any internal segment that could be replaced
+    by a cheaper one. If such a segment existed, then the full path
+    would not really be shortest.
+
+    Mathematical / algorithmic reasoning
+    ------------------------------------
+    This follows from Bellman's principle of optimality. Suppose a
+    shortest path from s to t contains a subpath from x to y. If that
+    subpath were not itself shortest, then we could replace it with a
+    cheaper x-to-y path. That would give a cheaper s-to-t path overall,
+    which contradicts the assumption that the original path was already
+    shortest.
+
+    Graphs generated for this test
+    ------------------------------
+    The test uses connected, undirected weighted graphs with at least
+    three nodes and positive integer edge weights. For each pair of
+    distinct nodes, one shortest path is computed, and then every
+    contiguous subpath inside it is checked against the independently
+    computed shortest-path distance between its endpoints.
+
+    Assumptions / preconditions
+    ---------------------------
+    - The graph is connected.
+    - The graph is undirected.
+    - All edge weights are strictly positive.
+    - When multiple shortest paths exist, the algorithm may return any
+      one of them, but every subpath of the chosen path should still be
+      optimal for its endpoints.
+
+    What a failure would suggest
+    ----------------------------
+    A failure would suggest that the returned path is not truly optimal,
+    even if its total cost may appear reasonable. It could point to a
+    bug in path reconstruction, tie handling, or in how shortest paths
+    are selected and reported by the algorithm.
+    """
+    dist = dict(nx.all_pairs_dijkstra_path_length(G))
+    nodes = list(G.nodes)
+    for s in nodes:
+        for t in nodes:
+            if s == t:
+                continue
+            path = nx.dijkstra_path(G, s, t)
+            for i in range(len(path)):
+                for j in range(i + 1, len(path)):
+                    sub = path[i:j + 1]
+                    assert _path_weight(G, sub) == dist[sub[0]][sub[-1]]
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — Reversing edges should swap directed distances
+# ---------------------------------------------------------------------------
+@settings(suppress_health_check=[HealthCheck.filter_too_much], max_examples=200)
+@given(weighted_graphs(directed=True))
+def test_reverse_graph_swaps_distances(G):
+    """
+    Property being tested
+    ---------------------
+    This test checks a symmetry property for directed graphs under edge
+    reversal. If every edge in a directed graph is reversed, then the
+    distance from s to t in the original graph should be the same as the
+    distance from t to s in the reversed graph.
+
+    Why this property is important
+    ------------------------------
+    This is a useful metamorphic property because it lets us transform
+    the input graph in a predictable way and check whether the output
+    changes in the expected manner. It is especially valuable for
+    catching mistakes related to edge direction.
+
+    Mathematical / algorithmic reasoning
+    ------------------------------------
+    Every directed path from s to t in the original graph corresponds to
+    a directed path from t to s in the reversed graph, using the same
+    edges in reverse order and with exactly the same total weight.
+    Because this correspondence holds for all possible paths, the
+    shortest-path distances must also match in the same way.
+
+    Graphs generated for this test
+    ------------------------------
+    The test uses random directed graphs with positive integer edge
+    weights. These graphs may be disconnected, so some node pairs may
+    not have any path between them. In those cases, distance is treated
+    as infinity on both sides of the comparison.
+
+    Assumptions / preconditions
+    ---------------------------
+    - The graph is directed.
+    - All edge weights are positive.
+    - Reversing the graph preserves all edge weights.
+    - Unreachable node pairs are interpreted as having infinite
+      distance.
+
+    What a failure would suggest
+    ----------------------------
+    A failure would strongly suggest that the algorithm is not handling
+    edge direction correctly. For example, it may be traversing the
+    wrong adjacency relation, mixing up incoming and outgoing edges, or
+    accidentally treating the graph as undirected in part of the logic.
+    """
+    Grev = G.reverse(copy=True)
+    for s in G.nodes:
+        d_fwd = nx.single_source_dijkstra_path_length(G, s)
+        for t in G.nodes:
+            if s == t:
+                continue
+            try:
+                d_back = nx.dijkstra_path_length(Grev, t, s)
+            except nx.NetworkXNoPath:
+                d_back = math.inf
+            expected = d_fwd.get(t, math.inf)
+            assert d_back == expected
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — Increasing one edge weight should not decrease distances
+# ---------------------------------------------------------------------------
+@settings(suppress_health_check=[HealthCheck.filter_too_much], max_examples=150)
+@given(
+    connected_weighted_graphs(min_nodes=3),
+    st.integers(min_value=1, max_value=100),
+)
+def test_weight_increase_is_monotone(G, delta):
+    """
+    Property being tested
+    ---------------------
+    This test checks monotonicity with respect to edge weights. If the
+    weight of one edge is increased while all other edge weights remain
+    unchanged, then no shortest-path distance in the graph should
+    decrease.
+
+    Why this property is important
+    ------------------------------
+    Shortest-path distances should respond predictably to changes in
+    edge costs. Making one edge more expensive cannot create a cheaper
+    route anywhere in the graph. This is a useful sanity check because
+    it verifies that the algorithm is really using the current weights
+    correctly.
+
+    Mathematical / algorithmic reasoning
+    ------------------------------------
+    Any path that existed before the weight increase still exists after
+    the change. Paths that use the modified edge become more expensive,
+    while paths that do not use it keep the same cost. Since no path can
+    become cheaper, the minimum over all path costs also cannot become
+    smaller. Therefore every shortest-path distance must stay the same
+    or increase.
+
+    Graphs generated for this test
+    ------------------------------
+    The test uses connected, undirected weighted graphs with at least
+    three nodes and positive integer edge weights. One existing edge is
+    selected, and its weight is increased by a random positive amount.
+    All-pairs shortest-path distances are computed before and after the
+    change and then compared.
+
+    Assumptions / preconditions
+    ---------------------------
+    - The graph is connected.
+    - The graph is undirected.
+    - All edge weights are positive before and after modification.
+    - At least one edge exists in the graph.
+    - The amount added to the selected edge weight is strictly positive.
+
+    What a failure would suggest
+    ----------------------------
+    A failure would indicate a serious inconsistency in how edge weights
+    are handled. It could mean the algorithm is reusing stale state,
+    not reading updated weights correctly, or producing shortest-path
+    values that do not match the modified graph.
+    """
+    edges = list(G.edges())
+    assume(len(edges) >= 1)
+    u, v = edges[0]
+
+    before = dict(nx.all_pairs_dijkstra_path_length(G))
+    G[u][v]["weight"] += delta
+    after = dict(nx.all_pairs_dijkstra_path_length(G))
+
+    for s in G.nodes:
+        for t in G.nodes:
+            assert after[s][t] >= before[s][t] - 1e-9
